@@ -4,7 +4,8 @@ Comprehensive unit tests for services.app_generate_service.AppGenerateService.
 Covers:
   - _build_streaming_task_on_subscribe  (streams / pubsub / exception / idempotency)
   - generate                           (COMPLETION / AGENT_CHAT / CHAT / ADVANCED_CHAT / WORKFLOW / invalid mode,
-                                         streaming & blocking, billing, quota-refund-on-error, rate_limit.exit)
+                                         streaming & blocking, billing, quota-refund-on-error, rate_limit.exit,
+                                         streaming slot held until close)
   - _get_max_active_requests            (all limit combos)
   - generate_single_iteration           (ADVANCED_CHAT / WORKFLOW / invalid mode)
   - generate_single_loop                (ADVANCED_CHAT / WORKFLOW / invalid mode)
@@ -13,11 +14,12 @@ Covers:
   - get_response_generator              (ended / non-ended workflow run)
 """
 
+import gc
 import json
 import threading
 import uuid
-from collections.abc import Callable
-from contextlib import contextmanager
+from collections.abc import Callable, Generator, Mapping
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,6 +28,7 @@ from sqlalchemy.orm import Session
 
 import services.app_generate_service as ags_module
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.app.features.rate_limiting.rate_limit import RateLimit, RateLimitGenerator
 from enums import DeploymentEdition, QuotaType
 from graphon.enums import WorkflowExecutionStatus
 from models.account import Account
@@ -70,6 +73,48 @@ class _DummyRateLimit:
 
     def generate(self, generator, request_id: str):
         return generator
+
+
+_STREAM_REQUEST_ID = "dummy-request-id"
+
+
+class _TrackingRateLimit(_DummyRateLimit):
+    """Records occupancy with Redis-hash semantics: one slot per request id."""
+
+    instances: list["_TrackingRateLimit"] = []
+
+    def __init__(self, client_id: str, max_active_requests: int) -> None:
+        super().__init__(client_id, max_active_requests)
+        self.enter_calls: list[str] = []
+        self.exit_calls: list[str] = []
+        self.active: set[str] = set()
+        self.instances.append(self)
+
+    def enter(self, request_id: str | None = None) -> str:
+        resolved_request_id = super().enter(request_id)
+        self.enter_calls.append(resolved_request_id)
+        self.active.add(resolved_request_id)
+        return resolved_request_id
+
+    def exit(self, request_id: str) -> None:
+        super().exit(request_id)
+        self.exit_calls.append(request_id)
+        self.active.discard(request_id)
+
+    def generate(self, generator: object, request_id: str) -> object:
+        if isinstance(generator, Mapping):
+            return generator
+        return RateLimitGenerator(
+            rate_limit=cast(RateLimit, self),
+            generator=cast(Generator[str, None, None], generator),
+            request_id=request_id,
+        )
+
+
+def _event_stream(*chunks: str, error: BaseException | None = None) -> Generator[str, None, None]:
+    yield from chunks
+    if error is not None:
+        raise error
 
 
 def _make_app(mode: AppMode | str, *, max_active_requests: int = 0) -> App:
@@ -144,12 +189,6 @@ def _make_workflow_run(*, run_id: str, ended: bool) -> WorkflowRun:
     )
     run.id = run_id
     return run
-
-
-@contextmanager
-def _noop_rate_limit_context(rate_limit, request_id):
-    """Drop-in replacement for rate_limit_context that doesn't touch Redis."""
-    yield
 
 
 # ---------------------------------------------------------------------------
@@ -318,11 +357,6 @@ class TestGenerate(_RealSessionTest):
     def _common(self, mocker: MockerFixture, config_overrides: Callable[..., None]):
         config_overrides(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY)
         mocker.patch("services.app_generate_service.RateLimit", _DummyRateLimit)
-        # Prevent AppExecutionParams.new from touching real models via isinstance
-        mocker.patch(
-            "services.app_generate_service.rate_limit_context",
-            _noop_rate_limit_context,
-        )
 
     # -- COMPLETION ---------------------------------------------------------
     def test_completion_mode(self, mocker: MockerFixture):
@@ -655,16 +689,142 @@ class TestGenerate(_RealSessionTest):
 
 
 # ---------------------------------------------------------------------------
+# generate – streaming rate limit
+# ---------------------------------------------------------------------------
+class TestGenerateStreamingRateLimit(_RealSessionTest):
+    """The app active-request slot stays occupied until a streaming run actually closes."""
+
+    @pytest.fixture(autouse=True)
+    def _common(self, mocker: MockerFixture, config_overrides: Callable[..., None]) -> None:
+        config_overrides(
+            DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY,
+            PUBSUB_REDIS_CHANNEL_TYPE="streams",
+        )
+        _TrackingRateLimit.instances.clear()
+        mocker.patch("services.app_generate_service.RateLimit", _TrackingRateLimit)
+
+    def _open(
+        self,
+        mocker: MockerFixture,
+        mode: AppMode,
+        events: Generator[str, None, None],
+    ) -> tuple[RateLimitGenerator, _TrackingRateLimit]:
+        mocker.patch.object(AppGenerateService, "_get_workflow", return_value=_make_workflow())
+        mocker.patch(
+            "services.app_generate_service.AppExecutionParams.new",
+            return_value=MagicMock(workflow_run_id="wfr-stream", model_dump_json=MagicMock(return_value="{}")),
+        )
+        mocker.patch("services.app_generate_service.workflow_based_app_execution_task.delay")
+        if mode is AppMode.ADVANCED_CHAT:
+            generator = MagicMock()
+            generator.retrieve_events.return_value = events
+            generator.convert_to_event_stream.side_effect = lambda value: value
+            mocker.patch("services.app_generate_service.AdvancedChatAppGenerator", return_value=generator)
+            args: Mapping[str, object] = {"workflow_id": None, "query": "hi", "inputs": {}}
+        elif mode is AppMode.WORKFLOW:
+            mocker.patch(
+                "services.app_generate_service.MessageBasedAppGenerator.retrieve_events",
+                return_value=events,
+            )
+            mocker.patch(
+                "services.app_generate_service.WorkflowAppGenerator.convert_to_event_stream",
+                side_effect=lambda value: value,
+            )
+            args = {"inputs": {}}
+        else:
+            raise AssertionError(f"unsupported streaming mode {mode}")
+
+        stream = AppGenerateService.generate(
+            app_model=_make_app(mode, max_active_requests=2),
+            user=_make_user(),
+            args=args,
+            invoke_from=InvokeFrom.SERVICE_API,
+            streaming=True,
+            session=self.session,
+        )
+        assert isinstance(stream, RateLimitGenerator)
+        return stream, _TrackingRateLimit.instances[-1]
+
+    def _assert_still_active(self, rate_limit: _TrackingRateLimit) -> None:
+        assert rate_limit.enter_calls == [_STREAM_REQUEST_ID]
+        assert rate_limit.exit_calls == []
+        assert rate_limit.active == {_STREAM_REQUEST_ID}
+
+    def _assert_released_once(self, rate_limit: _TrackingRateLimit) -> None:
+        assert rate_limit.exit_calls == [_STREAM_REQUEST_ID]
+        assert rate_limit.active == set()
+
+    @pytest.mark.parametrize("mode", [AppMode.WORKFLOW, AppMode.ADVANCED_CHAT])
+    def test_normal_close_releases_slot_once(self, mocker: MockerFixture, mode: AppMode) -> None:
+        stream, rate_limit = self._open(mocker, mode, _event_stream("one", "two"))
+        self._assert_still_active(rate_limit)
+
+        assert next(stream) == "one"
+        self._assert_still_active(rate_limit)
+        assert list(stream) == ["two"]
+        self._assert_released_once(rate_limit)
+
+        stream.close()
+        del stream
+        gc.collect()
+        self._assert_released_once(rate_limit)
+
+    @pytest.mark.parametrize("mode", [AppMode.WORKFLOW, AppMode.ADVANCED_CHAT])
+    def test_error_mid_stream_releases_slot_once(self, mocker: MockerFixture, mode: AppMode) -> None:
+        stream, rate_limit = self._open(
+            mocker,
+            mode,
+            _event_stream("one", error=RuntimeError("boom")),
+        )
+        self._assert_still_active(rate_limit)
+
+        assert next(stream) == "one"
+        self._assert_still_active(rate_limit)
+        with pytest.raises(RuntimeError, match="boom"):
+            next(stream)
+        self._assert_released_once(rate_limit)
+
+        stream.close()
+        del stream
+        gc.collect()
+        self._assert_released_once(rate_limit)
+
+    @pytest.mark.parametrize("mode", [AppMode.WORKFLOW, AppMode.ADVANCED_CHAT])
+    def test_client_disconnect_releases_slot_once(self, mocker: MockerFixture, mode: AppMode) -> None:
+        stream, rate_limit = self._open(mocker, mode, _event_stream("one", "two"))
+        self._assert_still_active(rate_limit)
+
+        assert next(stream) == "one"
+        self._assert_still_active(rate_limit)
+        stream.close()
+        self._assert_released_once(rate_limit)
+
+        stream.close()
+        with pytest.raises(StopIteration):
+            next(stream)
+        del stream
+        gc.collect()
+        self._assert_released_once(rate_limit)
+
+    @pytest.mark.parametrize("mode", [AppMode.WORKFLOW, AppMode.ADVANCED_CHAT])
+    def test_discarded_generator_releases_slot_once(self, mocker: MockerFixture, mode: AppMode) -> None:
+        stream, rate_limit = self._open(mocker, mode, _event_stream("one", "two"))
+        self._assert_still_active(rate_limit)
+
+        assert next(stream) == "one"
+        self._assert_still_active(rate_limit)
+        del stream
+        gc.collect()
+        self._assert_released_once(rate_limit)
+
+
+# ---------------------------------------------------------------------------
 # generate – billing / quota
 # ---------------------------------------------------------------------------
 class TestGenerateBilling(_RealSessionTest):
     @pytest.fixture(autouse=True)
     def _common(self, mocker: MockerFixture):
         mocker.patch("services.app_generate_service.RateLimit", _DummyRateLimit)
-        mocker.patch(
-            "services.app_generate_service.rate_limit_context",
-            _noop_rate_limit_context,
-        )
 
     def test_cloud_edition_consumes_quota(self, mocker: MockerFixture, config_overrides: Callable[..., None]):
         config_overrides(DEPLOYMENT_EDITION=DeploymentEdition.CLOUD)

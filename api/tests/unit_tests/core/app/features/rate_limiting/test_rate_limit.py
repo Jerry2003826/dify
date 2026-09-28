@@ -1,5 +1,7 @@
+import gc
 import threading
 import time
+from collections.abc import Generator
 from datetime import timedelta
 from unittest.mock import patch
 
@@ -449,6 +451,83 @@ class TestRateLimitGenerator:
 
         with pytest.raises(StopIteration):
             next(wrapped_gen)
+
+    def _open(self, redis_patch, source: Generator[str, None, None]):
+        redis_patch.configure_mock(
+            **{
+                "exists.return_value": False,
+                "setex.return_value": True,
+                "hdel.return_value": 1,
+            }
+        )
+        rate_limit = RateLimit("stream-client", 5)
+        return rate_limit.generate(source, "request-id")
+
+    def _assert_released_once(self, redis_patch) -> None:
+        redis_patch.hdel.assert_called_once_with("dify:rate_limit:stream-client:active_requests", "request-id")
+
+    def test_should_keep_slot_until_normal_completion_and_release_once(self, redis_patch):
+        def source() -> Generator[str, None, None]:
+            yield "one"
+            yield "two"
+
+        wrapped = self._open(redis_patch, source())
+        assert next(wrapped) == "one"
+        redis_patch.hdel.assert_not_called()
+        assert list(wrapped) == ["two"]
+        self._assert_released_once(redis_patch)
+
+        wrapped.close()
+        del wrapped
+        gc.collect()
+        self._assert_released_once(redis_patch)
+
+    def test_should_release_once_when_iteration_raises(self, redis_patch):
+        def source() -> Generator[str, None, None]:
+            yield "one"
+            raise RuntimeError("boom")
+
+        wrapped = self._open(redis_patch, source())
+        assert next(wrapped) == "one"
+        redis_patch.hdel.assert_not_called()
+        with pytest.raises(RuntimeError, match="boom"):
+            next(wrapped)
+        self._assert_released_once(redis_patch)
+
+        wrapped.close()
+        del wrapped
+        gc.collect()
+        self._assert_released_once(redis_patch)
+
+    def test_should_release_once_when_client_disconnects_mid_stream(self, redis_patch):
+        def source() -> Generator[str, None, None]:
+            yield "one"
+            yield "two"
+
+        wrapped = self._open(redis_patch, source())
+        assert next(wrapped) == "one"
+        redis_patch.hdel.assert_not_called()
+        wrapped.close()
+        self._assert_released_once(redis_patch)
+
+        wrapped.close()
+        with pytest.raises(StopIteration):
+            next(wrapped)
+        del wrapped
+        gc.collect()
+        self._assert_released_once(redis_patch)
+
+    def test_should_release_once_when_generator_is_discarded(self, redis_patch):
+        def source() -> Generator[str, None, None]:
+            yield "one"
+            yield "two"
+
+        wrapped = self._open(redis_patch, source())
+        assert next(wrapped) == "one"
+        redis_patch.hdel.assert_not_called()
+        del wrapped
+        gc.collect()
+        self._assert_released_once(redis_patch)
 
 
 class TestRateLimitConcurrency:

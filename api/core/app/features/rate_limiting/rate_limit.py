@@ -1,7 +1,9 @@
-import contextlib
+from __future__ import annotations
+
 import logging
 import time
 import uuid
+import weakref
 from collections.abc import Generator, Mapping
 from datetime import timedelta
 from typing import Any, Union
@@ -18,7 +20,7 @@ class RateLimit:
     _UNLIMITED_REQUEST_ID = "unlimited_request_id"
     _REQUEST_MAX_ALIVE_TIME = 10 * 60  # 10 minutes
     _ACTIVE_REQUESTS_COUNT_FLUSH_INTERVAL = 5 * 60  # recalculate request_count from request_detail every 5 minutes
-    _instance_dict: dict[str, "RateLimit"] = {}
+    _instance_dict: dict[str, RateLimit] = {}
     max_active_requests: int
 
     def __new__(cls, client_id: str, max_active_requests: int):
@@ -110,25 +112,32 @@ class RateLimit:
             )
 
 
-@contextlib.contextmanager
-def rate_limit_context(rate_limit: RateLimit, request_id: str | None):
-    request_id = rate_limit.enter(request_id)
-    yield
-    if request_id is not None:
-        rate_limit.exit(request_id)
-
-
 class RateLimitGenerator:
-    def __init__(self, rate_limit: RateLimit, generator: Generator[str, None, None], request_id: str):
+    """Iterator that owns one active-request slot until the stream is finished.
+
+    The caller enters the limiter before constructing this iterator. The slot is
+    released exactly once: when iteration ends, when iteration raises, when
+    ``close`` runs (client disconnect), or when this object is garbage-collected
+    without an earlier release. ``close`` and garbage collection share one release.
+    """
+
+    rate_limit: RateLimit
+    generator: Generator[str, None, None]
+    request_id: str
+    closed: bool
+    _finalizer: weakref.finalize[[RateLimit, str, Generator[str, None, None]], RateLimitGenerator]
+
+    def __init__(self, rate_limit: RateLimit, generator: Generator[str, None, None], request_id: str) -> None:
         self.rate_limit = rate_limit
         self.generator = generator
         self.request_id = request_id
         self.closed = False
+        self._finalizer = weakref.finalize(self, RateLimitGenerator._release, rate_limit, request_id, generator)
 
-    def __iter__(self):
+    def __iter__(self) -> RateLimitGenerator:
         return self
 
-    def __next__(self):
+    def __next__(self) -> str:
         if self.closed:
             raise StopIteration
         try:
@@ -137,9 +146,19 @@ class RateLimitGenerator:
             self.close()
             raise
 
-    def close(self):
-        if not self.closed:
-            self.closed = True
-            self.rate_limit.exit(self.request_id)
-            if self.generator is not None and hasattr(self.generator, "close"):
-                self.generator.close()
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        # detach() is True only when garbage collection has not released the slot yet.
+        if self._finalizer.detach():
+            self._release(self.rate_limit, self.request_id, self.generator)
+
+    @staticmethod
+    def _release(rate_limit: RateLimit, request_id: str, generator: Generator[str, None, None]) -> None:
+        try:
+            rate_limit.exit(request_id)
+        finally:
+            close = getattr(generator, "close", None)
+            if callable(close):
+                close()
